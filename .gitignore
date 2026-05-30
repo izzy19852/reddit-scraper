@@ -1,0 +1,46 @@
+# === Reddit Scraper — program-only repo ===
+
+# Secrets / credentials (NEVER commit)
+.env
+.env.*
+*.key
+*.pem
+
+# Unrelated program that lives in this folder and contains LIVE API keys.
+# Do not commit under any circumstances.
+bot.py
+
+# Generated scraper output (daily, large)
+reddit_digest_*.json
+reddit_summary_*.json
+*.json
+
+# Logs and diagnostic output dumps
+*.log
+*.out
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.venv*/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local editor / assistant config (may contain local secrets)
+.claude/
+.vscode/
+.idea/
+
+# Misc local notes
+GCS Commands.txt
+
+# OS
+Thumbs.db
+.DS_Store
