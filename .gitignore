@@ -15,9 +15,12 @@ reddit_digest_*.json
 reddit_summary_*.json
 *.json
 
-# Logs and diagnostic output dumps
+# Logs and generated diagnostic / state files
 *.log
 *.out
+*.flag
+*.tmp
+*.state
 logs/
 
 # Python
