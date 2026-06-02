@@ -1351,6 +1351,10 @@ def main() -> int:
     )
     ap.add_argument("--dry-run", action="store_true", help="print pull stats, skip Notion")
     ap.add_argument("--no-summary", action="store_true", help="skip LLM analysis")
+    ap.add_argument(
+        "--refresh-summary", action="store_true",
+        help="force a fresh LLM call even if today's summary file already exists",
+    )
     ap.add_argument("--no-bodies", action="store_true", help="skip fetching post bodies")
     ap.add_argument(
         "--body-min", type=int, default=0,
@@ -1397,17 +1401,34 @@ def main() -> int:
         return 1
 
     summary: dict | None = None
+    summary_failed = False
+    summary_path = script_dir / f"reddit_summary_{today}.json"
     if not args.no_summary and posts:
-        try:
-            summary = summarize_with_claude(pull)
-            summary_path = script_dir / f"reddit_summary_{today}.json"
-            summary_path.write_text(
-                json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
-            )
-            print(f"Saved summary -> {summary_path}", flush=True)
-        except Exception as e:
-            print(f"WARNING: summarization failed: {e}", file=sys.stderr)
-            print("Proceeding with appendix listing only.", file=sys.stderr)
+        # Reuse a summary already produced for today (e.g. by a prior run or a
+        # manual re-run) so one flaky `claude` call doesn't cost us the analysis.
+        # `--refresh-summary` forces a fresh call even when the file exists.
+        if summary_path.exists() and not args.refresh_summary:
+            try:
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                print(f"Reusing existing summary <- {summary_path}", flush=True)
+            except (OSError, json.JSONDecodeError) as e:
+                print(f"WARNING: could not read {summary_path}: {e}", file=sys.stderr)
+        if summary is None:
+            try:
+                summary = summarize_with_claude(pull)
+                summary_path.write_text(
+                    json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+                print(f"Saved summary -> {summary_path}", flush=True)
+            except Exception as e:
+                summary_failed = True
+                print(f"ERROR: summarization failed: {e}", file=sys.stderr)
+                print(
+                    "Writing digest with appendix only. Re-run "
+                    "(or `python reddit_digest.py --refresh-summary`) once "
+                    f"`claude` is reachable to backfill {summary_path.name}.",
+                    file=sys.stderr,
+                )
 
     if args.dry_run:
         print("\n--- Top Tier-1 / pain-language posts (dry run) ---")
@@ -1426,6 +1447,11 @@ def main() -> int:
     print(f"Built {len(blocks)} Notion blocks", flush=True)
     url = create_notion_page(token, parent_id, f"{today} — Chorrus buyer-signal digest", blocks)
     print(f"Created Notion page: {url}", flush=True)
+    if summary_failed:
+        # Digest was published, but without the AI analysis — surface a non-zero
+        # exit so the scheduler/log flags it instead of looking like a clean run.
+        print("Digest published WITHOUT AI summary (see error above).", file=sys.stderr)
+        return 3
     return 0
 
 

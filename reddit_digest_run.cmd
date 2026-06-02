@@ -3,7 +3,17 @@ setlocal
 set SCRIPT_DIR=%~dp0
 set LOG=%SCRIPT_DIR%reddit_digest.log
 set PATH=C:\Program Files\nodejs;%USERPROFILE%\AppData\Roaming\npm;%PATH%
+
+REM Headless `claude` auth: Task Scheduler ("run whether logged on or not")
+REM cannot read the interactive OAuth keychain, so the summarizer call fails
+REM and the digest publishes WITHOUT the AI summary. Provide a key here (or via
+REM the scheduled task's environment / a .env beside the script) so the
+REM non-interactive `claude` call can authenticate.
+REM   set ANTHROPIC_API_KEY=sk-ant-...
+
 echo. >> "%LOG%"
 echo === %DATE% %TIME% === >> "%LOG%"
 "C:\Users\islam\AppData\Local\Microsoft\WindowsApps\python.exe" "%SCRIPT_DIR%reddit_digest.py" >> "%LOG%" 2>&1
+REM Exit code 3 = digest published but the AI summary was lost (claude failed).
+if errorlevel 1 echo === exited with errorlevel %errorlevel% === >> "%LOG%"
 endlocal
