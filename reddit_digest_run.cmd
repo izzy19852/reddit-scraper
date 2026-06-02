@@ -13,7 +13,10 @@ REM   set ANTHROPIC_API_KEY=sk-ant-...
 
 echo. >> "%LOG%"
 echo === %DATE% %TIME% === >> "%LOG%"
-"C:\Users\islam\AppData\Local\Microsoft\WindowsApps\python.exe" "%SCRIPT_DIR%reddit_digest.py" >> "%LOG%" 2>&1
+REM --body-min 25: only fetch post bodies for posts with score>=25 or >=25
+REM comments (Tier 1 always fetched), so heavy-result days don't balloon the
+REM body-fetch phase. Lower it to widen body coverage, or 0 to fetch all.
+"C:\Users\islam\AppData\Local\Microsoft\WindowsApps\python.exe" "%SCRIPT_DIR%reddit_digest.py" --body-min 25 >> "%LOG%" 2>&1
 REM Exit code 3 = digest published but the AI summary was lost (claude failed).
 if errorlevel 1 echo === exited with errorlevel %errorlevel% === >> "%LOG%"
 endlocal
