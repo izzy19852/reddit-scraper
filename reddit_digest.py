@@ -65,12 +65,24 @@ ALL_SUBS = TIER1_SUBS + TIER2_SUBS + TIER3_SUBS
 # SECTION A.2 — QUERY SETS (both sets run in every subreddit)
 # ----------------------------------------------------------------------------
 QUERY_SET_AI = ["AI", "ChatGPT", "automation", "chatbot"]
+# Trimmed to the 8 highest-signal buyer-pain phrases (was 20). Each sub runs
+# every query, so this is the dominant request multiplier: cutting the set in
+# half takes a full run from 32x24=768 requests down to 32x12=384, with no loss
+# of subreddit coverage. The kept phrases still span all three product concepts
+# the summarizer scores:
+#   phone_agent  -> "missed calls", "after hours", "front desk",
+#                   "stuck on the phone"
+#   email_agent  -> "answering the same question", "leaking leads"
+#   sales_data_qa-> "spreadsheet reconcile", "scattered across"
+# Dropped as low-signal/noisy (generic overwhelm or brand names that match far
+# more off-topic posts than buyer intent): "tired of answering", "no time",
+# "drowning", "leaking bucket", "lost a customer", "lost a lead",
+# "doing it myself again", "hire help", "burning out", "another tool",
+# "QuickBooks", "Stripe Shopify".
 QUERY_SET_PAIN = [
-    "missed calls", "after hours", "front desk", "answering the same question",
-    "stuck on the phone", "tired of answering", "no time", "drowning",
-    "leaking bucket", "leaking leads", "lost a customer", "lost a lead",
-    "doing it myself again", "hire help", "burning out", "another tool",
-    "QuickBooks", "Stripe Shopify", "spreadsheet reconcile", "scattered across",
+    "missed calls", "after hours", "front desk", "stuck on the phone",
+    "answering the same question", "leaking leads", "spreadsheet reconcile",
+    "scattered across",
 ]
 QUERY_SETS: list[tuple[str, list[str]]] = [
     ("ai_language", QUERY_SET_AI),
