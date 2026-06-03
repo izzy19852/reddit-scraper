@@ -329,7 +329,87 @@ OUTPUT_OVERRIDE = (
     "pull does not satisfy contract A.3.\"} and nothing else.\n"
 )
 
-SUMMARY_SYSTEM_PROMPT = SPEC_DOC + OUTPUT_OVERRIDE
+# NOTE: SPEC_DOC / OUTPUT_OVERRIDE above are the legacy 9-section analyst spec,
+# kept for reference only. The live prompt below produces a plain-language,
+# four-lens digest (what people ask / supports / works against / real struggle).
+SUMMARY_SYSTEM_PROMPT = r"""You read Reddit posts from small-business owners and turn them into a SHORT,
+PLAIN-ENGLISH briefing for the founder of Chorrus. The reader is busy and is NOT
+a data analyst: in about 90 seconds they must understand what small-business
+owners are asking for, what helps Chorrus, what hurts Chorrus, and what these
+people are really struggling with underneath.
+
+ABOUT CHORRUS (the lens):
+Chorrus is an AI platform for small businesses (~$299/mo) with three product
+surfaces: (1) ask questions about your sales/business data, (2) an AI agent that
+answers your phone, (3) an AI agent that handles your email. Target buyer: the
+owner of a service business, e-commerce store, or clinic with enough revenue to
+justify a monthly tool.
+
+THE INPUT:
+A JSON object with a `posts` array. Each post has: anchor (e.g. "#35"), title,
+subreddit, subreddit_tier (1 = real buyers, 2 = mixed, 3 = peers/builders),
+score, num_comments, query_set ("pain_language" = an owner describing pain in
+their own words = strongest signal; "ai_language" = matched a buzzword = weaker),
+author_promotional_flag (true = the author is selling something), and
+body_excerpt (the post text).
+
+HOW TO WEIGH POSTS:
+- A Tier-1 post in pain_language is the strongest signal. One of those beats ten
+  Tier-3 "AI" posts.
+- Tier-3 posts are mostly other builders/employees talking, NOT buyers. Do not
+  treat their enthusiasm as demand.
+- author_promotional_flag == true means the author is promoting their own
+  product. NEVER put them under "what people are asking" or "people to message" —
+  they belong (if anywhere) under "works against Chorrus" as competition.
+- An owner venting about an incumbent (QuickBooks down, an OpenAI ban, etc.) is
+  NOT a buyer asking for Chorrus. Don't dress it up as demand.
+- Some pain matches are accidents: a plumber's "leaking leads" is a literal leak;
+  "after hours" can just mean a time of day. Ignore those; only use posts where a
+  real owner describes a real operational problem.
+
+YOUR JOB — produce these five things, all in PLAIN ENGLISH an owner would use,
+never analyst jargon. Banned words/phrases: "overfit", "falsification", "thesis",
+"wedge", "ICP", "race-to-the-bottom", "table-stakes", "greenfield", "signal
+density", "cohort", "validates". Write like you're explaining it to a friend.
+
+1. gist — 2-3 sentences: the single most important thing this week's posts told
+   us. A real paragraph, no lists, no hedging.
+
+2. what_people_are_asking — the recurring REQUESTS, grouped by what they want
+   (NOT one bullet per post — merge duplicates). Each item:
+     ask = the want in the owner's own voice ("Something to answer my phone so I
+       stop losing jobs")
+     who = the kind of business asking
+     prevalence = how common it was ("5+ posts", "a couple of owners")
+     quote = one word-for-word quote
+     anchor = the post it came from
+
+3. supports_chorrus — honest reasons the data is GOOD for Chorrus. Each:
+     point = one plain sentence; why = one plain sentence; anchor = best example.
+
+4. works_against_chorrus — reasons the data is BAD or HARD for Chorrus
+   (competitors giving the same thing away, this buyer being hard to reach,
+   owners wanting something else, price resistance, etc.). REQUIRED and must be
+   just as real as the support — do NOT soften it. Each: point, why, anchor.
+
+5. real_struggle — the deeper human problem under the surface asks. What are
+   these owners actually fighting every day?
+     insight = 2-4 plain sentences
+     what_it_means_for_chorrus = 1-2 sentences on how Chorrus should TALK to them.
+
+Plus people_to_message — 3-6 specific NON-promotional owners worth reaching out
+to. Each: anchor; who (plain description incl. business type/size if known);
+what_they_need (plain); and one short quote if there's a good one.
+
+RULES:
+- Quotes must be word-for-word from a post's title or body_excerpt.
+- Use real anchors only. Never invent posts or quotes.
+- A short section is fine if the data is thin. Do NOT pad.
+- If almost nothing real is in the pull, say so plainly in `gist`.
+
+OUTPUT: reply with ONE JSON object matching the provided schema. No prose, no
+markdown, no code fences.
+"""
 
 # On Windows the `claude` launcher is a .CMD wrapper and cmd.exe caps a command
 # line at ~8191 chars, so the 10.5K-char spec can't ride on --system-prompt.
@@ -343,162 +423,68 @@ SHORT_SYSTEM_PROMPT = (
 )
 
 # ----------------------------------------------------------------------------
-# OUTPUT SCHEMA (mirrors Section E)
+# OUTPUT SCHEMA — plain-language, four-lens digest
 # ----------------------------------------------------------------------------
 _ANCHOR = {"type": "string"}
-_CONCEPT_ENTRY = {
-    "type": "object",
-    "properties": {"anchor": _ANCHOR, "note": {"type": "string"}},
-    "required": ["anchor", "note"],
-    "additionalProperties": False,
-}
-_CONCEPT = {
+_ASK = {
     "type": "object",
     "properties": {
-        "support": {"type": "array", "items": _CONCEPT_ENTRY},
-        "contradict": {"type": "array", "items": _CONCEPT_ENTRY},
-        "adjacent": {"type": "array", "items": _CONCEPT_ENTRY},
-        "high_weight_notes": {"type": "string"},
+        "ask": {"type": "string"},
+        "who": {"type": "string"},
+        "prevalence": {"type": "string"},
+        "quote": {"type": "string"},
+        "anchor": _ANCHOR,
     },
-    "required": ["support", "contradict", "adjacent", "high_weight_notes"],
+    "required": ["ask", "who", "anchor"],
     "additionalProperties": False,
 }
-_THEME = {
+_POINT = {
     "type": "object",
-    "properties": {"theme": {"type": "string"}, "note": {"type": "string"}},
-    "required": ["theme"],
+    "properties": {
+        "point": {"type": "string"},
+        "why": {"type": "string"},
+        "anchor": _ANCHOR,
+    },
+    "required": ["point", "why"],
+    "additionalProperties": False,
+}
+_PERSON = {
+    "type": "object",
+    "properties": {
+        "anchor": _ANCHOR,
+        "who": {"type": "string"},
+        "what_they_need": {"type": "string"},
+        "quote": {"type": "string"},
+    },
+    "required": ["anchor", "who", "what_they_need"],
     "additionalProperties": False,
 }
 
 SUMMARY_SCHEMA = {
     "type": "object",
     "properties": {
-        "coverage_and_confidence": {
+        "gist": {"type": "string"},
+        "what_people_are_asking": {"type": "array", "items": _ASK},
+        "supports_chorrus": {"type": "array", "items": _POINT},
+        "works_against_chorrus": {"type": "array", "items": _POINT},
+        "real_struggle": {
             "type": "object",
             "properties": {
-                "summary": {"type": "string"},
-                "confidence": {"type": "string", "enum": ["HIGH", "MEDIUM", "LOW"]},
-                "coverage_warning": {"type": "string"},
-                "query_bias_warning": {"type": "string"},
+                "insight": {"type": "string"},
+                "what_it_means_for_chorrus": {"type": "string"},
             },
-            "required": ["summary", "confidence", "coverage_warning", "query_bias_warning"],
+            "required": ["insight", "what_it_means_for_chorrus"],
             "additionalProperties": False,
         },
-        "bear_case": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "anchor": _ANCHOR,
-                    "title": {"type": "string"},
-                    "subreddit": {"type": "string"},
-                    "tier": {"type": "integer"},
-                    "score": {"type": "integer"},
-                    "why": {"type": "string"},
-                },
-                "required": ["anchor", "title", "subreddit", "tier", "why"],
-                "additionalProperties": False,
-            },
-        },
-        "concept_test_scoreboard": {
-            "type": "object",
-            "properties": {
-                "sales_data_qa": _CONCEPT,
-                "phone_agent": _CONCEPT,
-                "email_agent": _CONCEPT,
-                "none_other": _CONCEPT,
-            },
-            "required": ["sales_data_qa", "phone_agent", "email_agent", "none_other"],
-            "additionalProperties": False,
-        },
-        "true_buyer_handraisers": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "anchor": _ANCHOR,
-                    "title": {"type": "string"},
-                    "surface": {"type": "string"},
-                    "evidence": {"type": "string"},
-                    "missing": {"type": "string"},
-                },
-                "required": ["anchor", "title", "surface", "missing"],
-                "additionalProperties": False,
-            },
-        },
-        "competitor_watch": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "anchor": _ANCHOR,
-                    "what": {"type": "string"},
-                    "surface": {"type": "string"},
-                    "distinctive": {"type": "string"},
-                    "promotional": {"type": "boolean"},
-                },
-                "required": ["what", "surface", "distinctive"],
-                "additionalProperties": False,
-            },
-        },
-        "atmospheric_risk": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "anchor": _ANCHOR,
-                    "title": {"type": "string"},
-                    "implication": {"type": "string"},
-                },
-                "required": ["title", "implication"],
-                "additionalProperties": False,
-            },
-        },
-        "recurring_vs_emerging": {
-            "type": "object",
-            "properties": {
-                "recurring": {"type": "array", "items": _THEME},
-                "emerging": {"type": "array", "items": _THEME},
-            },
-            "required": ["recurring", "emerging"],
-            "additionalProperties": False,
-        },
-        "notable_quotes": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string"},
-                    "anchor": _ANCHOR,
-                    "tag": {"type": "string", "enum": QUOTE_TAGS},
-                },
-                "required": ["text", "tag"],
-                "additionalProperties": False,
-            },
-        },
-        "what_to_do_this_week": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "anchor": _ANCHOR,
-                    "action": {"type": "string"},
-                },
-                "required": ["action"],
-                "additionalProperties": False,
-            },
-        },
+        "people_to_message": {"type": "array", "items": _PERSON},
     },
     "required": [
-        "coverage_and_confidence",
-        "bear_case",
-        "concept_test_scoreboard",
-        "true_buyer_handraisers",
-        "competitor_watch",
-        "atmospheric_risk",
-        "recurring_vs_emerging",
-        "notable_quotes",
-        "what_to_do_this_week",
+        "gist",
+        "what_people_are_asking",
+        "supports_chorrus",
+        "works_against_chorrus",
+        "real_struggle",
+        "people_to_message",
     ],
     "additionalProperties": False,
 }
@@ -1078,180 +1064,97 @@ def _entries(rich_list: list[list[dict]], block_fn=bullet) -> list[dict]:
 
 
 # ============================================================================
-# Section renderers (Section E)
+# Section renderers — plain-language four-lens digest
 # ============================================================================
-def build_coverage(cov: dict) -> list[dict]:
-    blocks = [heading(2, "1. Coverage and Confidence")]
-    conf = cov.get("confidence", "?")
-    blocks.append(paragraph([rt("Confidence: ", bold=True), rt(str(conf))]))
-    summary = (cov.get("summary") or "").strip()
-    if summary:
-        blocks.append(paragraph([rt(summary)]))
-    cw = (cov.get("coverage_warning") or "").strip()
-    if cw:
-        blocks.append(callout([rt("COVERAGE WARNING: ", bold=True), rt(cw)], emoji="⚠️"))
-    qbw = (cov.get("query_bias_warning") or "").strip()
-    if qbw:
-        blocks.append(callout([rt("QUERY-BIAS WARNING: ", bold=True), rt(qbw)], emoji="⚠️"))
+def ref_compact(anchor: str, by_anchor: dict) -> list[dict]:
+    """A short clickable reference: '#35 (r/smallbusiness)'."""
+    key = str(anchor or "").lstrip("#").strip()
+    p = by_anchor.get(key)
+    if not p:
+        return [rt(f"[#{key}]")] if key else []
+    label = f"#{key} ({p['subreddit']})"
+    return [rt(label, link=p["url"])] if p.get("url") else [rt(label)]
+
+
+def _quote_with_attr(quote: str, anchor: str, by_anchor: dict) -> list[dict]:
+    blocks = [quote_block([rt(f"“{quote.strip()}”")])]
+    attr = ref_compact(anchor, by_anchor)
+    if attr:
+        blocks.append(paragraph([rt("— ")] + attr))
     return blocks
 
 
-def build_bear_case(items: list[dict], by_anchor: dict) -> list[dict]:
-    blocks = [heading(2, "2. Bear Case")]
-    if len(items) < 5:
-        blocks.append(
-            callout(
-                [rt(f"DEFICIT: only {len(items)} bear-case posts (<5 required). "
-                    "Likely a query/coverage bias — see Section 1.")],
-                emoji="⚠️",
-            )
-        )
+def build_gist(gist: str) -> list[dict]:
+    g = (gist or "").strip()
+    return [heading(2, "The gist"), paragraph([rt(g or "(no summary produced)")])]
+
+
+def build_asks(items: list[dict], by_anchor: dict) -> list[dict]:
+    blocks = [heading(2, "What people are asking for")]
     if not items:
-        blocks.append(paragraph([rt("(none surfaced)")]))
+        blocks.append(paragraph([rt("(nothing clearly surfaced this week)")]))
         return blocks
     for it in items:
-        line = ref_rich(it.get("anchor", ""), by_anchor)
+        ask = (it.get("ask") or "").strip()
+        meta = [s for s in [(it.get("who") or "").strip(),
+                            (it.get("prevalence") or "").strip()] if s]
+        line = [rt(ask, bold=True)]
+        if meta:
+            line.append(rt("  —  " + " · ".join(meta)))
+        blocks.append(bullet(line))
+        quote = (it.get("quote") or "").strip()
+        if quote:
+            blocks += _quote_with_attr(quote, it.get("anchor"), by_anchor)
+    return blocks
+
+
+def build_points(items: list[dict], by_anchor: dict, title: str, empty: str) -> list[dict]:
+    blocks = [heading(2, title)]
+    if not items:
+        blocks.append(paragraph([rt(empty)]))
+        return blocks
+    for it in items:
+        point = (it.get("point") or "").strip()
         why = (it.get("why") or "").strip()
+        line = [rt(point, bold=True)]
         if why:
-            line = line + [rt(" — " + why)]
+            line.append(rt(" — " + why))
+        ref = ref_compact(it.get("anchor"), by_anchor)
+        if ref:
+            line += [rt("  · ")] + ref
         blocks.append(bullet(line))
     return blocks
 
 
-def build_scoreboard(board: dict, by_anchor: dict) -> list[dict]:
-    blocks = [heading(2, "3. Concept-Test Scoreboard")]
-    for key, label in CONCEPTS:
-        concept = board.get(key) or {}
-        sup = concept.get("support") or []
-        con = concept.get("contradict") or []
-        adj = concept.get("adjacent") or []
+def build_struggle(struggle: dict) -> list[dict]:
+    blocks = [heading(2, "What they're really struggling with")]
+    insight = (struggle.get("insight") or "").strip()
+    means = (struggle.get("what_it_means_for_chorrus") or "").strip()
+    blocks.append(paragraph([rt(insight or "(no insight produced)")]))
+    if means:
         blocks.append(
-            heading(3, f"{label}  —  support {len(sup)} · contradict {len(con)} · adjacent {len(adj)}")
+            callout([rt("What this means for Chorrus: ", bold=True), rt(means)], emoji="💡")
         )
-        for sub_label, entries in (("SUPPORT", sup), ("CONTRADICT", con), ("ADJACENT", adj)):
-            if not entries:
-                continue
-            blocks.append(paragraph([rt(sub_label, bold=True)]))
-            for e in entries:
-                line = ref_rich(e.get("anchor", ""), by_anchor)
-                note = (e.get("note") or "").strip()
-                if note:
-                    line = line + [rt(" — " + note)]
-                blocks.append(bullet(line))
-        hw = (concept.get("high_weight_notes") or "").strip()
-        if hw:
-            blocks.append(callout([rt("High-weight (Tier1 + pain): ", bold=True), rt(hw)], emoji="🎯"))
     return blocks
 
 
-def build_handraisers(items: list[dict], by_anchor: dict) -> list[dict]:
-    blocks = [heading(2, "4. True-Buyer Handraisers")]
+def build_people(items: list[dict], by_anchor: dict) -> list[dict]:
+    blocks = [heading(2, "People worth messaging")]
     if not items:
-        blocks.append(paragraph([rt("Empty list — no posts met all four strict criteria this pull. "
-                                    "This is acceptable and informative.")]))
+        blocks.append(paragraph([rt("(none clearly worth reaching out to this week)")]))
         return blocks
     for it in items:
-        blocks.append(paragraph(ref_rich(it.get("anchor", ""), by_anchor)))
-        surface = (it.get("surface") or "").strip()
-        if surface:
-            blocks.append(bullet([rt("Chorrus surface: ", bold=True), rt(surface)]))
-        evidence = (it.get("evidence") or "").strip()
-        if evidence:
-            blocks.append(bullet([rt("Evidence: ", bold=True), rt(evidence)]))
-        missing = (it.get("missing") or "").strip()
-        if missing:
-            blocks.append(bullet([rt("Missing / to qualify: ", bold=True), rt(missing)]))
-    return blocks
-
-
-def build_competitor_watch(items: list[dict], by_anchor: dict) -> list[dict]:
-    blocks = [heading(2, "5. Competitor / Adjacent Build Watch")]
-    if not items:
-        blocks.append(paragraph([rt("(none surfaced)")]))
-        return blocks
-    for it in items:
-        line: list[dict] = []
-        anchor = it.get("anchor")
-        if anchor:
-            line += ref_rich(anchor, by_anchor) + [rt(" — ")]
-        line.append(rt((it.get("what") or "").strip(), bold=True))
-        surface = (it.get("surface") or "").strip()
-        if surface:
-            line.append(rt(f"  · surface: {surface}"))
-        distinctive = (it.get("distinctive") or "").strip()
-        if distinctive:
-            line.append(rt(f"  · {distinctive}"))
-        if it.get("promotional"):
-            line.append(rt("  [PROMOTIONAL AUTHOR]", bold=True))
+        who = (it.get("who") or "").strip()
+        line = ref_compact(it.get("anchor"), by_anchor)
+        if who:
+            line += [rt("  —  ")] + [rt(who, bold=True)]
         blocks.append(bullet(line))
-    return blocks
-
-
-def build_atmospheric(items: list[dict], by_anchor: dict) -> list[dict]:
-    blocks = [heading(2, "6. Atmospheric Risk")]
-    blocks.append(paragraph([rt("NOT BUYER INTENT.", bold=True)]))
-    if not items:
-        blocks.append(paragraph([rt("(none surfaced)")]))
-        return blocks
-    for it in items:
-        line: list[dict] = []
-        anchor = it.get("anchor")
-        if anchor:
-            line += ref_rich(anchor, by_anchor) + [rt(" — ")]
-        line.append(rt((it.get("title") or "").strip()))
-        blocks.append(bullet(line))
-        impl = (it.get("implication") or "").strip()
-        if impl:
-            blocks.append(paragraph([rt("Implication for Chorrus: ", bold=True), rt(impl)]))
-    return blocks
-
-
-def build_themes(rve: dict) -> list[dict]:
-    blocks = [heading(2, "7. Recurring vs Emerging Themes")]
-    for label, key in (("RECURRING", "recurring"), ("EMERGING", "emerging")):
-        items = rve.get(key) or []
-        blocks.append(heading(3, label))
-        if not items:
-            blocks.append(paragraph([rt("(none)")]))
-            continue
-        for t in items:
-            theme = (t.get("theme") or "").strip()
-            note = (t.get("note") or "").strip()
-            rich = [rt(theme, bold=True)]
-            if note:
-                rich.append(rt(" — " + note))
-            blocks.append(bullet(rich))
-    return blocks
-
-
-def build_quotes(items: list[dict], by_anchor: dict) -> list[dict]:
-    blocks = [heading(2, "8. Notable Quotes")]
-    if not items:
-        blocks.append(paragraph([rt("(none surfaced)")]))
-        return blocks
-    for q in items:
-        text = (q.get("text") or "").strip()
-        tag = q.get("tag", "")
-        blocks.append(quote_block([rt(f"[{tag}] ", bold=True), rt(f"“{text}”")]))
-        anchor = q.get("anchor")
-        if anchor:
-            blocks.append(paragraph([rt("— ")] + ref_rich(anchor, by_anchor)))
-    return blocks
-
-
-def build_actions(items: list[dict], by_anchor: dict) -> list[dict]:
-    blocks = [heading(2, "9. What To Do This Week")]
-    if not items:
-        blocks.append(paragraph([rt("(no post-tied actions possible this pull)")]))
-        return blocks
-    for it in items:
-        action = (it.get("action") or "").strip()
-        line: list[dict] = []
-        anchor = it.get("anchor")
-        if anchor:
-            line += ref_rich(anchor, by_anchor) + [rt(" — ")]
-        line.append(rt(action))
-        blocks.append(numbered(line))
+        need = (it.get("what_they_need") or "").strip()
+        if need:
+            blocks.append(paragraph([rt("    needs: ", bold=True), rt(need)]))
+        quote = (it.get("quote") or "").strip()
+        if quote:
+            blocks.append(quote_block([rt(f"“{quote}”")]))
     return blocks
 
 
@@ -1298,23 +1201,23 @@ def build_blocks(pull: dict, errors: list[dict], summary: dict | None) -> list[d
         summary = None
 
     if summary:
-        blocks += build_coverage(summary.get("coverage_and_confidence") or {})
+        blocks += build_gist(summary.get("gist") or "")
         blocks.append(divider())
-        blocks += build_bear_case(summary.get("bear_case") or [], by_anchor)
+        blocks += build_asks(summary.get("what_people_are_asking") or [], by_anchor)
         blocks.append(divider())
-        blocks += build_scoreboard(summary.get("concept_test_scoreboard") or {}, by_anchor)
+        blocks += build_points(
+            summary.get("supports_chorrus") or [], by_anchor,
+            "What supports Chorrus", "(no clear support this week)",
+        )
         blocks.append(divider())
-        blocks += build_handraisers(summary.get("true_buyer_handraisers") or [], by_anchor)
+        blocks += build_points(
+            summary.get("works_against_chorrus") or [], by_anchor,
+            "What works against Chorrus", "(no clear headwinds this week)",
+        )
         blocks.append(divider())
-        blocks += build_competitor_watch(summary.get("competitor_watch") or [], by_anchor)
+        blocks += build_struggle(summary.get("real_struggle") or {})
         blocks.append(divider())
-        blocks += build_atmospheric(summary.get("atmospheric_risk") or [], by_anchor)
-        blocks.append(divider())
-        blocks += build_themes(summary.get("recurring_vs_emerging") or {})
-        blocks.append(divider())
-        blocks += build_quotes(summary.get("notable_quotes") or [], by_anchor)
-        blocks.append(divider())
-        blocks += build_actions(summary.get("what_to_do_this_week") or [], by_anchor)
+        blocks += build_people(summary.get("people_to_message") or [], by_anchor)
         blocks.append(divider())
 
     blocks += build_appendix(posts)
@@ -1362,6 +1265,11 @@ def main() -> int:
         help=f"base seconds between requests (default {SLEEP_BETWEEN_QUERIES}; jitter added on top)",
     )
     ap.add_argument("--dry-run", action="store_true", help="print pull stats, skip Notion")
+    ap.add_argument(
+        "--from-pull", default=None, metavar="PATH",
+        help="skip scraping; load an existing reddit_digest_<date>.json and just "
+             "(re)summarize + publish. Pair with --refresh-summary to force a fresh LLM call.",
+    )
     ap.add_argument("--no-summary", action="store_true", help="skip LLM analysis")
     ap.add_argument(
         "--refresh-summary", action="store_true",
@@ -1378,35 +1286,50 @@ def main() -> int:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     print(f"Reddit digest for {today}", flush=True)
 
-    subs_filter = [s.strip() for s in args.subs.split(",")] if args.subs else None
-    raw_by_id, errors, subs_queried = fetch_all(
-        args.limit, args.max_subs, args.sleep, subs_filter
-    )
-    kept = filter_posts(raw_by_id)
-    if not args.no_bodies:
-        fetch_bodies(kept, args.sleep, args.body_min)
-    posts = finalize_posts(kept)
-    pull = build_pull(posts, subs_queried, today)
-    if _throttle_state["events"]:
+    script_dir = Path(__file__).resolve().parent
+
+    if args.from_pull:
+        # Re-summarize an existing pull without re-scraping Reddit.
+        pull_path = Path(args.from_pull)
+        if not pull_path.is_absolute():
+            pull_path = script_dir / pull_path
+        pull = json.loads(pull_path.read_text(encoding="utf-8"))
+        errors = pull.pop("errors", []) if isinstance(pull, dict) else []
+        posts = pull.get("posts", [])
+        today = pull.get("pull_date", today)
         print(
-            f"Throttle events: {_throttle_state['events']} "
-            f"(adaptive delay settled at +{_throttle_state['extra']:.0f}s/request)",
+            f"Loaded pull from {pull_path.name}: {len(posts)} posts (date {today}). "
+            "Skipping scrape.",
             flush=True,
         )
-    print(
-        f"Pull: {pull['total_posts']} posts "
-        f"(T1 {pull['tier1_posts']} / T2 {pull['tier2_posts']} / T3 {pull['tier3_posts']}; "
-        f"pain {pull['pain_language_posts']} / ai {pull['ai_language_posts']})",
-        flush=True,
-    )
-
-    script_dir = Path(__file__).resolve().parent
-    raw_path = script_dir / f"reddit_digest_{today}.json"
-    raw_path.write_text(
-        json.dumps({"errors": errors, **pull}, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    print(f"Saved pull JSON -> {raw_path}", flush=True)
+    else:
+        subs_filter = [s.strip() for s in args.subs.split(",")] if args.subs else None
+        raw_by_id, errors, subs_queried = fetch_all(
+            args.limit, args.max_subs, args.sleep, subs_filter
+        )
+        kept = filter_posts(raw_by_id)
+        if not args.no_bodies:
+            fetch_bodies(kept, args.sleep, args.body_min)
+        posts = finalize_posts(kept)
+        pull = build_pull(posts, subs_queried, today)
+        if _throttle_state["events"]:
+            print(
+                f"Throttle events: {_throttle_state['events']} "
+                f"(adaptive delay settled at +{_throttle_state['extra']:.0f}s/request)",
+                flush=True,
+            )
+        print(
+            f"Pull: {pull['total_posts']} posts "
+            f"(T1 {pull['tier1_posts']} / T2 {pull['tier2_posts']} / T3 {pull['tier3_posts']}; "
+            f"pain {pull['pain_language_posts']} / ai {pull['ai_language_posts']})",
+            flush=True,
+        )
+        raw_path = script_dir / f"reddit_digest_{today}.json"
+        raw_path.write_text(
+            json.dumps({"errors": errors, **pull}, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        print(f"Saved pull JSON -> {raw_path}", flush=True)
 
     if not posts and not args.dry_run:
         print("No posts fetched — aborting Notion write.", file=sys.stderr)
