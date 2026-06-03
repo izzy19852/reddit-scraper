@@ -65,12 +65,24 @@ ALL_SUBS = TIER1_SUBS + TIER2_SUBS + TIER3_SUBS
 # SECTION A.2 — QUERY SETS (both sets run in every subreddit)
 # ----------------------------------------------------------------------------
 QUERY_SET_AI = ["AI", "ChatGPT", "automation", "chatbot"]
+# Trimmed to the 8 highest-signal buyer-pain phrases (was 20). Each sub runs
+# every query, so this is the dominant request multiplier: cutting the set in
+# half takes a full run from 32x24=768 requests down to 32x12=384, with no loss
+# of subreddit coverage. The kept phrases still span all three product concepts
+# the summarizer scores:
+#   phone_agent  -> "missed calls", "after hours", "front desk",
+#                   "stuck on the phone"
+#   email_agent  -> "answering the same question", "leaking leads"
+#   sales_data_qa-> "spreadsheet reconcile", "scattered across"
+# Dropped as low-signal/noisy (generic overwhelm or brand names that match far
+# more off-topic posts than buyer intent): "tired of answering", "no time",
+# "drowning", "leaking bucket", "lost a customer", "lost a lead",
+# "doing it myself again", "hire help", "burning out", "another tool",
+# "QuickBooks", "Stripe Shopify".
 QUERY_SET_PAIN = [
-    "missed calls", "after hours", "front desk", "answering the same question",
-    "stuck on the phone", "tired of answering", "no time", "drowning",
-    "leaking bucket", "leaking leads", "lost a customer", "lost a lead",
-    "doing it myself again", "hire help", "burning out", "another tool",
-    "QuickBooks", "Stripe Shopify", "spreadsheet reconcile", "scattered across",
+    "missed calls", "after hours", "front desk", "stuck on the phone",
+    "answering the same question", "leaking leads", "spreadsheet reconcile",
+    "scattered across",
 ]
 QUERY_SETS: list[tuple[str, list[str]]] = [
     ("ai_language", QUERY_SET_AI),
@@ -1351,6 +1363,10 @@ def main() -> int:
     )
     ap.add_argument("--dry-run", action="store_true", help="print pull stats, skip Notion")
     ap.add_argument("--no-summary", action="store_true", help="skip LLM analysis")
+    ap.add_argument(
+        "--refresh-summary", action="store_true",
+        help="force a fresh LLM call even if today's summary file already exists",
+    )
     ap.add_argument("--no-bodies", action="store_true", help="skip fetching post bodies")
     ap.add_argument(
         "--body-min", type=int, default=0,
@@ -1397,17 +1413,34 @@ def main() -> int:
         return 1
 
     summary: dict | None = None
+    summary_failed = False
+    summary_path = script_dir / f"reddit_summary_{today}.json"
     if not args.no_summary and posts:
-        try:
-            summary = summarize_with_claude(pull)
-            summary_path = script_dir / f"reddit_summary_{today}.json"
-            summary_path.write_text(
-                json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
-            )
-            print(f"Saved summary -> {summary_path}", flush=True)
-        except Exception as e:
-            print(f"WARNING: summarization failed: {e}", file=sys.stderr)
-            print("Proceeding with appendix listing only.", file=sys.stderr)
+        # Reuse a summary already produced for today (e.g. by a prior run or a
+        # manual re-run) so one flaky `claude` call doesn't cost us the analysis.
+        # `--refresh-summary` forces a fresh call even when the file exists.
+        if summary_path.exists() and not args.refresh_summary:
+            try:
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                print(f"Reusing existing summary <- {summary_path}", flush=True)
+            except (OSError, json.JSONDecodeError) as e:
+                print(f"WARNING: could not read {summary_path}: {e}", file=sys.stderr)
+        if summary is None:
+            try:
+                summary = summarize_with_claude(pull)
+                summary_path.write_text(
+                    json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+                print(f"Saved summary -> {summary_path}", flush=True)
+            except Exception as e:
+                summary_failed = True
+                print(f"ERROR: summarization failed: {e}", file=sys.stderr)
+                print(
+                    "Writing digest with appendix only. Re-run "
+                    "(or `python reddit_digest.py --refresh-summary`) once "
+                    f"`claude` is reachable to backfill {summary_path.name}.",
+                    file=sys.stderr,
+                )
 
     if args.dry_run:
         print("\n--- Top Tier-1 / pain-language posts (dry run) ---")
@@ -1426,6 +1459,11 @@ def main() -> int:
     print(f"Built {len(blocks)} Notion blocks", flush=True)
     url = create_notion_page(token, parent_id, f"{today} — Chorrus buyer-signal digest", blocks)
     print(f"Created Notion page: {url}", flush=True)
+    if summary_failed:
+        # Digest was published, but without the AI analysis — surface a non-zero
+        # exit so the scheduler/log flags it instead of looking like a clean run.
+        print("Digest published WITHOUT AI summary (see error above).", file=sys.stderr)
+        return 3
     return 0
 
 

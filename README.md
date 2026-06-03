@@ -28,9 +28,17 @@ Read from environment variables (nothing hardcoded):
 python reddit_digest.py                 # full run
 python reddit_digest.py --dry-run       # print pull stats, skip Notion
 python reddit_digest.py --no-summary    # skip LLM analysis
+python reddit_digest.py --refresh-summary  # force a fresh LLM call
 python reddit_digest.py --limit 25      # results per (sub, query)
 python reddit_digest.py --max-subs 3    # test: only first N subreddits
 ```
+
+If today's `reddit_summary_<date>.json` already exists, the run reuses it
+instead of calling the LLM again — so a single flaky `claude` call no longer
+costs you the analysis; just re-run to backfill. Use `--refresh-summary` to
+override. If summarization fails outright, the digest is still published (with
+the appendix) but the process exits non-zero (code `3`) so the scheduler flags
+it rather than looking like a clean run.
 
 ## Notes
 
