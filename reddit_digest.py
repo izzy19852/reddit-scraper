@@ -390,7 +390,7 @@ HOW TO WEIGH POSTS:
   replies are a caution. You may quote a comment, but say it's a commenter, not
   the original poster.
 
-YOUR JOB — produce these five things, all in PLAIN ENGLISH an owner would use,
+YOUR JOB — produce the sections below, all in PLAIN ENGLISH an owner would use,
 never analyst jargon. Banned words/phrases: "overfit", "falsification", "thesis",
 "wedge", "ICP", "race-to-the-bottom", "table-stakes", "greenfield", "signal
 density", "cohort", "validates". Write like you're explaining it to a friend.
@@ -419,6 +419,23 @@ density", "cohort", "validates". Write like you're explaining it to a friend.
    these owners actually fighting every day?
      insight = 2-4 plain sentences
      what_it_means_for_chorrus = 1-2 sentences on how Chorrus should TALK to them.
+
+6. do_next — 3-6 CONCRETE actions for Chorrus to take THIS WEEK, drawn from the
+   posts. NOT generic advice like "refine positioning" or "do more research."
+   Real moves a founder could act on tomorrow: a specific person to DM and the
+   exact question to ask; a landing-page headline to test, lifted from a real
+   quote; one use-case to lead with and why; a guarantee or proof point to add
+   to outreach. Each item:
+     point = the action, starting with a verb ("DM the handyman in #4 and ask…")
+     why = the evidence/post behind it
+     anchor = the post it's tied to (when there is one)
+
+7. avoid — 3-6 specific things Chorrus should NOT do, drawn from THIS week's
+   signal: a message that will backfire, a buyer segment to skip, a price framing
+   to avoid, a feature not to lead with. Concrete, not platitudes. Each item:
+     point = the thing to avoid, starting with "Don't" or "Avoid"
+     why = the evidence/post behind it
+     anchor = the post it's tied to (when there is one)
 
 Plus people_to_message — 3-6 specific NON-promotional owners worth reaching out
 to. Each: anchor; who (plain description incl. business type/size if known);
@@ -499,6 +516,8 @@ SUMMARY_SCHEMA = {
             "required": ["insight", "what_it_means_for_chorrus"],
             "additionalProperties": False,
         },
+        "do_next": {"type": "array", "items": _POINT},
+        "avoid": {"type": "array", "items": _POINT},
         "people_to_message": {"type": "array", "items": _PERSON},
     },
     "required": [
@@ -507,6 +526,8 @@ SUMMARY_SCHEMA = {
         "supports_chorrus",
         "works_against_chorrus",
         "real_struggle",
+        "do_next",
+        "avoid",
         "people_to_message",
     ],
     "additionalProperties": False,
@@ -1352,6 +1373,16 @@ def build_blocks(pull: dict, errors: list[dict], summary: dict | None) -> list[d
         )
         blocks.append(divider())
         blocks += build_struggle(summary.get("real_struggle") or {})
+        blocks.append(divider())
+        blocks += build_points(
+            summary.get("do_next") or [], by_anchor,
+            "What to do next", "(no concrete actions this week)",
+        )
+        blocks.append(divider())
+        blocks += build_points(
+            summary.get("avoid") or [], by_anchor,
+            "What to avoid", "(no clear traps this week)",
+        )
         blocks.append(divider())
         blocks += build_people(summary.get("people_to_message") or [], by_anchor)
         blocks.append(divider())
