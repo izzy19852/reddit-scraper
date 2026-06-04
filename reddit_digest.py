@@ -31,7 +31,7 @@ import shutil
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -40,16 +40,22 @@ import requests
 # SECTION A.1 — SUBREDDIT TIERS
 # ----------------------------------------------------------------------------
 TIER1_SUBS = [
-    "smallbusiness", "restaurantowners", "sweatystartup", "HVAC", "Plumbing",
-    "Welding", "Roofing", "electricians", "Landscaping", "PoolService",
-    "AutoBody", "AutoDetailing", "dentistry", "orthodontics", "Optometry",
-    "Chiropractic", "PhysicalTherapy", "Veterinary", "medspas", "lawpractice",
-    "Bookkeeping",
+    # Owner-majority subs: clinics, professional services, and owner-operated
+    # service businesses where the poster is usually the buyer.
+    "smallbusiness", "restaurantowners", "sweatystartup", "dentistry",
+    "orthodontics", "Optometry", "Chiropractic", "PhysicalTherapy", "medspas",
+    "lawpractice", "Bookkeeping", "handyman", "cleaning", "pestcontrol",
+    "MobileDetailing", "Construction", "realtors",
 ]
-TIER2_SUBS = ["ecommerce", "shopify", "Etsy", "Accounting"]
+TIER2_SUBS = [
+    "ecommerce", "shopify", "Etsy",
+    # Trades: some buyer content but majority workers/employees, not owners.
+    "HVAC", "Plumbing", "Welding", "Roofing", "electricians", "Landscaping",
+    "PoolService", "AutoBody", "AutoDetailing", "Veterinary",
+]
 TIER3_SUBS = [
     "Entrepreneur", "EntrepreneurRideAlong", "startups", "ChatGPT", "OpenAI",
-    "artificial", "business",
+    "artificial", "business", "Accounting",
 ]
 
 SUBREDDIT_TIER: dict[str, int] = {}
@@ -130,12 +136,24 @@ ADAPTIVE_MAX = 10.0         # cap on the accumulated adaptive delay
 _throttle_state = {"extra": 0.0, "events": 0}
 CLAUDE_FALLBACK = Path.home() / "AppData" / "Roaming" / "npm" / "claude.cmd"
 BODY_EXCERPT_LEN = 500
+# Only keep posts created within this many hours of the run (the "72-hour
+# outlook"). Searches use t=week, then we filter client-side on the post's
+# timestamp. Override with --window-hours.
+WINDOW_HOURS = 72
+# Top comments pulled from each fetched post page (same request as the body),
+# to capture other owners chiming in. Stored richer; trimmed for the LLM.
+TOP_COMMENTS = 4
+COMMENT_LEN = 280
 # LLM call: retry on transient failures, and cap how many posts go to the model
-# (a full nightly run can surface 800+ posts, which would overflow the call). We
-# send the top-weighted subset for analysis; the Notion appendix lists them all.
+# (a full run can surface hundreds of posts, which would overflow the call). We
+# send the top-weighted subset, with bodies+comments trimmed to a token budget;
+# the Notion appendix lists every post.
 LLM_RETRIES = 3
 LLM_RETRY_SLEEP = 15.0
-LLM_POST_CAP = 120
+LLM_POST_CAP = 90
+LLM_BODY_LEN = 500          # body chars sent to the model per post
+LLM_COMMENTS = 3            # comments sent to the model per post
+LLM_COMMENT_LEN = 200       # chars per comment sent to the model
 
 # Phase-0 concept options (Section C) -> schema keys / Notion labels.
 CONCEPTS = [
@@ -346,12 +364,13 @@ owner of a service business, e-commerce store, or clinic with enough revenue to
 justify a monthly tool.
 
 THE INPUT:
-A JSON object with a `posts` array. Each post has: anchor (e.g. "#35"), title,
-subreddit, subreddit_tier (1 = real buyers, 2 = mixed, 3 = peers/builders),
-score, num_comments, query_set ("pain_language" = an owner describing pain in
-their own words = strongest signal; "ai_language" = matched a buzzword = weaker),
-author_promotional_flag (true = the author is selling something), and
-body_excerpt (the post text).
+A JSON object with a `posts` array — the strongest posts from roughly the last
+72 hours. Each post has: anchor (e.g. "#35"), title, subreddit, tier (1 = real
+buyers, 2 = mixed, 3 = peers/builders), score, num_comments, posted (timestamp),
+query_set ("pain_language" = an owner describing pain in their own words =
+strongest signal; "ai_language" = matched a buzzword = weaker), promotional
+(true = the author is selling something), body (the post text), and comments (a
+few of the top replies from OTHER redditors, each with its score).
 
 HOW TO WEIGH POSTS:
 - A Tier-1 post in pain_language is the strongest signal. One of those beats ten
@@ -366,6 +385,10 @@ HOW TO WEIGH POSTS:
 - Some pain matches are accidents: a plumber's "leaking leads" is a literal leak;
   "after hours" can just mean a time of day. Ignore those; only use posts where a
   real owner describes a real operational problem.
+- Use the comments to judge whether OTHER owners share the pain: lots of upvoted
+  "same here" replies make a pain more real; "just hire someone" or skeptical
+  replies are a caution. You may quote a comment, but say it's a commenter, not
+  the original poster.
 
 YOUR JOB — produce these five things, all in PLAIN ENGLISH an owner would use,
 never analyst jargon. Banned words/phrases: "overfit", "falsification", "thesis",
@@ -531,6 +554,14 @@ _PERMA_RE = re.compile(r'href="(/r/[^"]+/comments/[^"]+?)"')
 _SCORE_RE = re.compile(r'class="search-score">([\d,]+)\s+point')
 _COMMENTS_RE = re.compile(r'class="search-comments may-blank"[^>]*>([\d,]+)\s+comment')
 _AUTHOR_RE = re.compile(r'class="author may-blank[^"]*"[^>]*>([^<]+)</a>')
+_TIME_RE = re.compile(r'<time[^>]*datetime="([^"]+)"')
+
+
+def _parse_iso(s: str) -> float | None:
+    try:
+        return datetime.fromisoformat(s).timestamp()
+    except (ValueError, TypeError):
+        return None
 
 
 def parse_search_html(html: str) -> list[dict]:
@@ -554,6 +585,8 @@ def parse_search_html(html: str) -> list[dict]:
         score_m = _SCORE_RE.search(block)
         comments_m = _COMMENTS_RE.search(block)
         author_m = _AUTHOR_RE.search(block)
+        time_m = _TIME_RE.search(block)
+        created_iso = time_m.group(1) if time_m else ""
         posts.append(
             {
                 "id": fid.group(1),
@@ -564,6 +597,8 @@ def parse_search_html(html: str) -> list[dict]:
                 "num_comments": int(comments_m.group(1).replace(",", "")) if comments_m else 0,
                 "permalink": html_lib.unescape(perma_m.group(1)) if perma_m else "",
                 "author": author_m.group(1).strip() if author_m else "[deleted]",
+                "created_iso": created_iso,
+                "_created_utc": _parse_iso(created_iso),
                 # Self-posts carry a "self" thumbnail; only they have body text.
                 "_is_self": "thumbnail self" in block,
             }
@@ -613,7 +648,7 @@ def fetch_subreddit(
         "q": query,
         "restrict_sr": "on",
         "sort": "top",
-        "t": "week",
+        "t": "month",
         "limit": limit,
     }
     resp = _get_with_backoff(session, REDDIT_SEARCH.format(sub=subreddit), params)
@@ -643,10 +678,70 @@ def extract_post_body(html: str, post_id: str) -> str:
     return html_lib.unescape(_WS_RE.sub(" ", text)).strip()
 
 
-def fetch_post_body(session: requests.Session, post_id: str, permalink: str) -> str:
-    # limit=1 keeps the comment tree (and page size) small; we only want the body.
-    resp = _get_with_backoff(session, f"https://old.reddit.com{permalink}", {"limit": 1})
-    return extract_post_body(resp.text, post_id)
+_COMMENT_AREA_RE = re.compile(r"""class=['"]commentarea['"]""")
+_COMMENT_BLOCK_RE = re.compile(r'data-fullname="t1_[a-z0-9]+"')
+_COMMENT_AUTHOR_RE = re.compile(r'data-author="([^"]+)"')
+_COMMENT_SCORE_RE = re.compile(r'class="score unvoted"[^>]*title="(-?\d+)"')
+_COMMENT_BODY_RE = re.compile(r'<div class="md">(.*?)</div></div>', re.S)
+# Strip a trailing run of old.reddit comment-footer buttons that can leak in.
+_BUTTON_TAIL_RE = re.compile(
+    r"\s*(?:permalink|embed|save|parent|report|reply|give award|share|hide|"
+    r"delete|edit|children|load more comments)"
+    r"(?:\s+(?:permalink|embed|save|parent|report|reply|give award|share|hide|"
+    r"delete|edit|children|load more comments|\d+))*\s*$",
+    re.I,
+)
+
+
+def extract_comments(
+    html: str, max_comments: int = TOP_COMMENTS, max_len: int = COMMENT_LEN
+) -> list[dict]:
+    """Pull the top few comments (by old.reddit 'top' sort) from a post page.
+
+    Comment blocks are anchored on data-fullname="t1_…". For each we take the
+    author, score, and the first md body in the block (its own text, before any
+    nested replies). Good enough to capture other owners chiming in.
+    """
+    area = _COMMENT_AREA_RE.search(html)
+    if not area:
+        return []
+    region = html[area.end():]
+    starts = [m.start() for m in _COMMENT_BLOCK_RE.finditer(region)]
+    out: list[dict] = []
+    for i, s in enumerate(starts):
+        if len(out) >= max_comments:
+            break
+        e = starts[i + 1] if i + 1 < len(starts) else len(region)
+        block = region[s:e]
+        body_m = _COMMENT_BODY_RE.search(block)
+        if not body_m:
+            continue
+        text = html_lib.unescape(_WS_RE.sub(" ", _TAG_RE.sub(" ", body_m.group(1)))).strip()
+        text = _BUTTON_TAIL_RE.sub("", text).strip()
+        if len(text) < 20:
+            continue
+        author_m = _COMMENT_AUTHOR_RE.search(block)
+        author = author_m.group(1) if author_m else "[deleted]"
+        if author == "AutoModerator":  # rules/bot boilerplate, not signal
+            continue
+        score_m = _COMMENT_SCORE_RE.search(block)
+        out.append({
+            "author": f"u/{author}",
+            "score": int(score_m.group(1)) if score_m else None,
+            "text": text[:max_len],
+        })
+    return out
+
+
+def fetch_post_page(
+    session: requests.Session, post_id: str, permalink: str
+) -> tuple[str, list[dict]]:
+    """Fetch a post page once; return (body, top_comments). sort=top surfaces the
+    most-upvoted discussion; limit keeps the page from loading the full tree."""
+    resp = _get_with_backoff(
+        session, f"https://old.reddit.com{permalink}", {"limit": 30, "sort": "top"}
+    )
+    return extract_post_body(resp.text, post_id), extract_comments(resp.text)
 
 
 def fetch_bodies(kept: list[dict], sleep_base: float, min_engagement: int = 0) -> None:
@@ -672,12 +767,14 @@ def fetch_bodies(kept: list[dict], sleep_base: float, min_engagement: int = 0) -
         return
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
-    print(f"Fetching bodies for {len(targets)} self-posts...", flush=True)
+    print(f"Fetching bodies + comments for {len(targets)} self-posts...", flush=True)
     for i, rec in enumerate(targets, 1):
         if i > 1:
             _polite_sleep(sleep_base)
         try:
-            rec["selftext"] = fetch_post_body(session, rec["id"], rec["permalink"])
+            rec["selftext"], rec["top_comments"] = fetch_post_page(
+                session, rec["id"], rec["permalink"]
+            )
         except requests.RequestException as e:
             print(f"    !! body {rec.get('id')}: {e}", flush=True)
         if i % 25 == 0 or i == len(targets):
@@ -759,16 +856,28 @@ def _count_promo_markers(text: str) -> int:
     return count
 
 
-def filter_posts(raw_by_id: dict) -> list[dict]:
-    """SECTION A.5 — min-quality filter (Tier 1 exempt). Returns kept raw recs."""
+def filter_posts(raw_by_id: dict, window_cutoff: float | None = None) -> list[dict]:
+    """Min-quality filter (Tier 1 exempt) + the time-window filter.
+
+    window_cutoff is an epoch seconds floor; posts created before it are dropped.
+    Posts with no parseable timestamp are kept (rare).
+    """
     kept = []
+    dropped_old = 0
     for rec in raw_by_id.values():
+        if window_cutoff is not None:
+            created = rec.get("_created_utc")
+            if created is not None and created < window_cutoff:
+                dropped_old += 1
+                continue
         tier = rec["_tier"]
         score = rec.get("score", 0) or 0
         comments = rec.get("num_comments", 0) or 0
         if tier != 1 and score < 2 and comments < 3:
             continue
         kept.append(rec)
+    if dropped_old:
+        print(f"  (dropped {dropped_old} posts older than the time window)", flush=True)
     return kept
 
 
@@ -813,13 +922,17 @@ def finalize_posts(kept: list[dict]) -> list[dict]:
                 "author_promotional_flag": promo_flag,
                 "query_used": rec["_query_used"],
                 "query_set": rec["_query_set"],
+                "created_iso": rec.get("created_iso", ""),
                 "body_excerpt": body[:BODY_EXCERPT_LEN],
+                "top_comments": rec.get("top_comments", []),
             }
         )
     return posts
 
 
-def build_pull(posts: list[dict], subs_queried: list[str], date_str: str) -> dict:
+def build_pull(
+    posts: list[dict], subs_queried: list[str], date_str: str, window_hours: int = WINDOW_HOURS
+) -> dict:
     """SECTION A.6 — header object plus posts array."""
     tier_counts = {1: 0, 2: 0, 3: 0}
     pain = ai = 0
@@ -832,6 +945,7 @@ def build_pull(posts: list[dict], subs_queried: list[str], date_str: str) -> dic
     queries_run = sorted(set(QUERY_SET_AI + QUERY_SET_PAIN))
     return {
         "pull_date": date_str,
+        "window_hours": window_hours,
         "total_posts": len(posts),
         "tier1_posts": tier_counts[1],
         "tier2_posts": tier_counts[2],
@@ -928,13 +1042,35 @@ def select_posts_for_llm(posts: list[dict], cap: int) -> list[dict]:
     return ranked[:cap]
 
 
+def _trim_post_for_llm(p: dict) -> dict:
+    """A lean, token-budgeted copy of a post for the model (trims body + the
+    number/length of comments, and drops fields the model doesn't need)."""
+    comments = [
+        {"score": c.get("score"), "text": (c.get("text") or "")[:LLM_COMMENT_LEN]}
+        for c in (p.get("top_comments") or [])[:LLM_COMMENTS]
+    ]
+    return {
+        "anchor": p["anchor"],
+        "title": p["title"],
+        "subreddit": p["subreddit"],
+        "tier": p["subreddit_tier"],
+        "score": p["score"],
+        "num_comments": p["num_comments"],
+        "posted": p.get("created_iso", ""),
+        "query_set": p["query_set"],
+        "promotional": p["author_promotional_flag"],
+        "body": (p.get("body_excerpt") or "")[:LLM_BODY_LEN],
+        "comments": comments,
+    }
+
+
 def summarize_with_claude(pull: dict, timeout: int = 600) -> dict:
     claude_cmd = resolve_claude_cmd()
     # Send only the top-weighted subset for analysis (a full run can overflow the
     # call); keep the real header totals so coverage/confidence stays accurate.
     selected = select_posts_for_llm(pull["posts"], LLM_POST_CAP)
     llm_pull = dict(pull)
-    llm_pull["posts"] = selected
+    llm_pull["posts"] = [_trim_post_for_llm(p) for p in selected]
     if len(selected) < len(pull["posts"]):
         llm_pull["_analysis_note"] = (
             f"posts truncated to top {len(selected)} of {len(pull['posts'])} by "
@@ -1280,6 +1416,10 @@ def main() -> int:
         "--body-min", type=int, default=0,
         help="only fetch bodies for posts with score>=N or comments>=N (Tier 1 always; 0=all)",
     )
+    ap.add_argument(
+        "--window-hours", type=int, default=WINDOW_HOURS,
+        help=f"only keep posts created within the last N hours (default {WINDOW_HOURS}; 0=no filter)",
+    )
     args = ap.parse_args()
 
     load_dotenv()
@@ -1307,11 +1447,17 @@ def main() -> int:
         raw_by_id, errors, subs_queried = fetch_all(
             args.limit, args.max_subs, args.sleep, subs_filter
         )
-        kept = filter_posts(raw_by_id)
+        cutoff = None
+        if args.window_hours and args.window_hours > 0:
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=args.window_hours)
+            ).timestamp()
+            print(f"Time window: last {args.window_hours}h", flush=True)
+        kept = filter_posts(raw_by_id, cutoff)
         if not args.no_bodies:
             fetch_bodies(kept, args.sleep, args.body_min)
         posts = finalize_posts(kept)
-        pull = build_pull(posts, subs_queried, today)
+        pull = build_pull(posts, subs_queried, today, args.window_hours)
         if _throttle_state["events"]:
             print(
                 f"Throttle events: {_throttle_state['events']} "
