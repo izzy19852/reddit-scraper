@@ -134,6 +134,22 @@ BACKOFF_MAX = 300.0         # cap a single backoff at 5 min
 ADAPTIVE_STEP = 1.0         # seconds added to every delay per throttle event
 ADAPTIVE_MAX = 10.0         # cap on the accumulated adaptive delay
 _throttle_state = {"extra": 0.0, "events": 0}
+# Circuit breaker + loop-back. Once Reddit starts hard-throttling this IP, EVERY
+# request 403s and each one burns ~5 min of per-request backoff before failing —
+# so a throttled stretch can add hours of dead waiting. Instead: when a (sub,
+# query) pair exhausts its retries on a throttle we SKIP it (defer it) rather
+# than drop it; after CIRCUIT_BREAKER_THRESHOLD consecutive throttled pairs we
+# trip the breaker and skip the rest of the pass FAST (no backoff), then LOOP
+# BACK over the deferred pairs in a later pass after a longer cooldown.
+CIRCUIT_BREAKER_THRESHOLD = 3   # consecutive throttled pairs that trip the breaker
+CIRCUIT_COOLDOWN = 180.0        # rest this long before a loop-back retry pass
+MAX_PASSES = 3                  # initial pass + up to (MAX_PASSES - 1) loop-backs
+
+
+class Throttled(requests.RequestException):
+    """Request exhausted its retries because of rate-limiting (403/429/503),
+    as opposed to a network or non-throttle HTTP error. Lets fetch_all defer the
+    (sub, query) pair and loop back to it instead of dropping it."""
 CLAUDE_FALLBACK = Path.home() / "AppData" / "Roaming" / "npm" / "claude.cmd"
 BODY_EXCERPT_LEN = 500
 # Only keep posts created within this many hours of the run (the "72-hour
@@ -628,41 +644,53 @@ def parse_search_html(html: str) -> list[dict]:
 
 
 def _get_with_backoff(
-    session: requests.Session, url: str, params: dict | None = None
+    session: requests.Session,
+    url: str,
+    params: dict | None = None,
+    max_retries: int = MAX_RETRIES,
 ) -> requests.Response:
     """GET with exponential backoff on throttle codes (403/429/503).
 
     Honors Retry-After when present, otherwise backs off 20s, 40s, 80s, ...
-    (capped). Raises the last error if all retries fail.
+    (capped). Raises Throttled if still rate-limited after max_retries (so the
+    caller can defer-and-loop-back), or the underlying HTTPError for any other
+    4xx/5xx. Pass max_retries=0 to fail fast on a throttle — used once the
+    circuit breaker has tripped, so deferring the rest of a pass is cheap.
     """
     noted = False
-    for attempt in range(MAX_RETRIES + 1):
+    resp = None
+    for attempt in range(max_retries + 1):
         resp = session.get(url, params=params, timeout=20)
-        if resp.status_code in THROTTLE_CODES and attempt < MAX_RETRIES:
-            if not noted:  # step the adaptive floor once per request, not per retry
-                _note_throttle()
-                noted = True
-            retry_after = resp.headers.get("Retry-After")
-            if retry_after and retry_after.strip().isdigit():
-                wait = float(retry_after)
-            else:
-                wait = min(BACKOFF_BASE * (2 ** attempt), BACKOFF_MAX)
-            wait += random.uniform(0, SLEEP_JITTER)
-            print(
-                f"    .. {resp.status_code} throttled; backing off {wait:.0f}s "
-                f"(retry {attempt + 1}/{MAX_RETRIES})",
-                flush=True,
-            )
-            time.sleep(wait)
-            continue
-        resp.raise_for_status()
-        return resp
-    resp.raise_for_status()  # exhausted retries
-    return resp
+        if resp.status_code not in THROTTLE_CODES:
+            resp.raise_for_status()
+            return resp
+        if not noted:  # step the adaptive floor once per request, not per retry
+            _note_throttle()
+            noted = True
+        if attempt >= max_retries:
+            break
+        retry_after = resp.headers.get("Retry-After")
+        if retry_after and retry_after.strip().isdigit():
+            wait = float(retry_after)
+        else:
+            wait = min(BACKOFF_BASE * (2 ** attempt), BACKOFF_MAX)
+        wait += random.uniform(0, SLEEP_JITTER)
+        print(
+            f"    .. {resp.status_code} throttled; backing off {wait:.0f}s "
+            f"(retry {attempt + 1}/{max_retries})",
+            flush=True,
+        )
+        time.sleep(wait)
+    code = resp.status_code if resp is not None else "?"
+    raise Throttled(f"{code} rate-limited after {max_retries} retries: {url}")
 
 
 def fetch_subreddit(
-    session: requests.Session, query: str, subreddit: str, limit: int
+    session: requests.Session,
+    query: str,
+    subreddit: str,
+    limit: int,
+    max_retries: int = MAX_RETRIES,
 ) -> list[dict]:
     """Scrape one (sub, query) from old.reddit HTML."""
     params = {
@@ -672,7 +700,9 @@ def fetch_subreddit(
         "t": "month",
         "limit": limit,
     }
-    resp = _get_with_backoff(session, REDDIT_SEARCH.format(sub=subreddit), params)
+    resp = _get_with_backoff(
+        session, REDDIT_SEARCH.format(sub=subreddit), params, max_retries
+    )
     return parse_search_html(resp.text)
 
 
@@ -802,66 +832,139 @@ def fetch_bodies(kept: list[dict], sleep_base: float, min_engagement: int = 0) -
             print(f"    bodies {i}/{len(targets)}", flush=True)
 
 
+def _merge_posts(
+    posts: list[dict], sub: str, tier: int, set_name: str, query: str, raw_by_id: dict
+) -> None:
+    """A.4 dedup: fold one (sub, query) result into raw_by_id, accumulating the
+    _query_used / _query_set / _tier / _sub tags on the shared record."""
+    for p in posts:
+        pid = p.get("id") or p.get("name") or p.get("permalink")
+        if pid is None:
+            continue
+        rec = raw_by_id.get(pid)
+        if rec is None:
+            rec = p
+            rec["_query_used"] = []
+            rec["_query_set"] = "ai_language"
+            rec["_tier"] = tier
+            rec["_sub"] = sub
+            raw_by_id[pid] = rec
+        if query not in rec["_query_used"]:
+            rec["_query_used"].append(query)
+        # pain-language wins ties (A.4)
+        if set_name == "pain_language":
+            rec["_query_set"] = "pain_language"
+
+
 def fetch_all(
     limit: int,
     max_subs: int | None,
     sleep_base: float,
     subs_filter: list[str] | None = None,
 ) -> tuple[dict, list[dict], list[str]]:
-    """Run both query sets in every subreddit.
+    """Run both query sets in every subreddit, with skip-and-loop-back on
+    rate-limiting.
+
+    A (sub, query) pair that exhausts its retries on a throttle is SKIPPED
+    (deferred), not dropped; after CIRCUIT_BREAKER_THRESHOLD consecutive throttled
+    pairs the breaker trips and the rest of the pass is skipped fast (no backoff).
+    Deferred pairs are retried in up to MAX_PASSES-1 LOOP-BACK passes, each after
+    a CIRCUIT_COOLDOWN rest. Pairs still throttled after the final pass are
+    recorded as errors.
 
     Returns (raw_by_id, errors, subs_queried). raw_by_id is keyed by Reddit post
-    id; each value carries the raw post plus accumulated _query_used / _query_set
-    / _tier / _sub tags (A.4 dedup happens here).
+    id; each value carries the raw post plus accumulated tags (A.4 dedup).
     """
     if subs_filter:
         subs = [s for s in subs_filter if s in SUBREDDIT_TIER]
     else:
         subs = ALL_SUBS[:max_subs] if max_subs else ALL_SUBS
-    raw_by_id: dict[str, dict] = {}
-    errors: list[dict] = []
-    first = True
-    total_pairs = len(subs) * (len(QUERY_SET_AI) + len(QUERY_SET_PAIN))
-    done = 0
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
+
+    # Flat worklist of (sub, tier, set_name, query) — one entry per pair.
+    worklist: list[tuple[str, int, str, str]] = []
     for sub in subs:
         tier = SUBREDDIT_TIER[sub]
         for set_name, queries in QUERY_SETS:
             for query in queries:
-                if not first:
-                    _polite_sleep(sleep_base)
-                first = False
-                done += 1
-                print(
-                    f"[{done}/{total_pairs}] T{tier} r/{sub} {set_name} q={query!r}",
-                    flush=True,
-                )
-                try:
-                    posts = fetch_subreddit(session, query, sub, limit)
-                except requests.RequestException as e:
-                    print(f"    !! {e}", flush=True)
-                    errors.append({"subreddit": sub, "query": query, "error": str(e)})
-                    continue
-                if posts:
-                    print(f"    -> {len(posts)} posts", flush=True)
-                for p in posts:
-                    pid = p.get("id") or p.get("name") or p.get("permalink")
-                    if pid is None:
-                        continue
-                    rec = raw_by_id.get(pid)
-                    if rec is None:
-                        rec = p
-                        rec["_query_used"] = []
-                        rec["_query_set"] = "ai_language"
-                        rec["_tier"] = tier
-                        rec["_sub"] = sub
-                        raw_by_id[pid] = rec
-                    if query not in rec["_query_used"]:
-                        rec["_query_used"].append(query)
-                    # pain-language wins ties (A.4)
-                    if set_name == "pain_language":
-                        rec["_query_set"] = "pain_language"
+                worklist.append((sub, tier, set_name, query))
+
+    raw_by_id: dict[str, dict] = {}
+    errors: list[dict] = []
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
+
+    total_pairs = len(worklist)
+    completed = 0
+    first = True
+    pending = worklist
+    for pass_no in range(1, MAX_PASSES + 1):
+        if not pending:
+            break
+        if pass_no > 1:
+            print(
+                f"\n== Loop-back pass {pass_no}/{MAX_PASSES}: retrying "
+                f"{len(pending)} rate-limited pair(s) after a "
+                f"{CIRCUIT_COOLDOWN:.0f}s cooldown ==",
+                flush=True,
+            )
+            time.sleep(CIRCUIT_COOLDOWN)
+            _throttle_state["extra"] = 0.0  # give the retry pass a clean cadence
+
+        deferred: list[tuple[str, int, str, str]] = []
+        consecutive_throttles = 0
+        breaker_tripped = False
+        for sub, tier, set_name, query in pending:
+            if not first:
+                _polite_sleep(sleep_base)
+            first = False
+            label = f"T{tier} r/{sub} {set_name} q={query!r}"
+            print(f"[{completed}/{total_pairs} p{pass_no}] {label}", flush=True)
+            # Once tripped, try once with no retries so failing pairs defer fast
+            # instead of burning ~5 min of backoff each.
+            retries = 0 if breaker_tripped else MAX_RETRIES
+            try:
+                posts = fetch_subreddit(session, query, sub, limit, retries)
+            except Throttled:
+                consecutive_throttles += 1
+                deferred.append((sub, tier, set_name, query))
+                print("    .. rate-limited; skipping (will loop back)", flush=True)
+                if (
+                    not breaker_tripped
+                    and consecutive_throttles >= CIRCUIT_BREAKER_THRESHOLD
+                ):
+                    breaker_tripped = True
+                    print(
+                        f"    !! {CIRCUIT_BREAKER_THRESHOLD} pairs throttled in a row "
+                        "— circuit breaker tripped: skipping the rest of this pass "
+                        "fast and looping back to them later.",
+                        flush=True,
+                    )
+                continue
+            except requests.RequestException as e:
+                consecutive_throttles = 0
+                print(f"    !! {e}", flush=True)
+                errors.append({"subreddit": sub, "query": query, "error": str(e)})
+                continue
+            consecutive_throttles = 0
+            if breaker_tripped:  # a success means the IP recovered — resume normal
+                breaker_tripped = False
+                print("    .. requests succeeding again; circuit breaker reset.", flush=True)
+            completed += 1
+            if posts:
+                print(f"    -> {len(posts)} posts", flush=True)
+            _merge_posts(posts, sub, tier, set_name, query, raw_by_id)
+        pending = deferred
+
+    for sub, tier, set_name, query in pending:  # still throttled after all passes
+        errors.append(
+            {"subreddit": sub, "query": query, "error": "rate-limited (gave up after all passes)"}
+        )
+    if pending:
+        print(
+            f"  (gave up on {len(pending)} pair(s) still rate-limited after "
+            f"{MAX_PASSES} passes)",
+            flush=True,
+        )
     return raw_by_id, errors, [f"r/{s}" for s in subs]
 
 
