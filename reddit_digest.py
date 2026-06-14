@@ -134,14 +134,27 @@ BACKOFF_MAX = 300.0         # cap a single backoff at 5 min
 ADAPTIVE_STEP = 1.0         # seconds added to every delay per throttle event
 ADAPTIVE_MAX = 10.0         # cap on the accumulated adaptive delay
 _throttle_state = {"extra": 0.0, "events": 0}
-# Circuit breaker + loop-back. Once Reddit starts hard-throttling this IP, EVERY
-# request 403s and each one burns ~5 min of per-request backoff before failing —
-# so a throttled stretch can add hours of dead waiting. Instead: when a (sub,
-# query) pair exhausts its retries on a throttle we SKIP it (defer it) rather
-# than drop it; after CIRCUIT_BREAKER_THRESHOLD consecutive throttled pairs we
-# trip the breaker and skip the rest of the pass FAST (no backoff), then LOOP
-# BACK over the deferred pairs in a later pass after a longer cooldown.
-CIRCUIT_BREAKER_THRESHOLD = 3   # consecutive throttled pairs that trip the breaker
+# Transient network errors (connection reset / dropped / timed out) are raised
+# by session.get() itself, BEFORE any HTTP status is seen, so the throttle
+# backoff above never covers them — an overnight connectivity blip would fail
+# every pair outright. Retry them on their own short budget (network blips
+# recover in seconds, unlike rate-limits), then fall back to skip-and-loop-back.
+NETWORK_RETRIES = 3           # retries per request on a transient network error
+NETWORK_BACKOFF_BASE = 3.0    # first network backoff; doubles each retry (3, 6, 12)
+NETWORK_BACKOFF_MAX = 30.0    # cap a single network backoff
+TRANSIENT_NET_ERRORS = (
+    requests.ConnectionError,
+    requests.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+)
+# Circuit breaker + loop-back. Once Reddit starts hard-throttling this IP (or the
+# network drops for a stretch), EVERY request fails and each one burns minutes of
+# per-request backoff — so a bad stretch can add hours of dead waiting. Instead:
+# when a (sub, query) pair exhausts its retries (throttle OR network) we SKIP it
+# (defer it) rather than drop it; after CIRCUIT_BREAKER_THRESHOLD consecutive
+# failures we trip the breaker and skip the rest of the pass FAST (no backoff),
+# then LOOP BACK over the deferred pairs in a later pass after a longer cooldown.
+CIRCUIT_BREAKER_THRESHOLD = 3   # consecutive failed pairs that trip the breaker
 CIRCUIT_COOLDOWN = 180.0        # rest this long before a loop-back retry pass
 MAX_PASSES = 3                  # initial pass + up to (MAX_PASSES - 1) loop-backs
 
@@ -150,6 +163,12 @@ class Throttled(requests.RequestException):
     """Request exhausted its retries because of rate-limiting (403/429/503),
     as opposed to a network or non-throttle HTTP error. Lets fetch_all defer the
     (sub, query) pair and loop back to it instead of dropping it."""
+
+
+# Errors that should defer-and-loop-back rather than be dropped: rate-limiting
+# and exhausted transient network errors. (Throttled is a RequestException but
+# not a ConnectionError, so it never overlaps with TRANSIENT_NET_ERRORS.)
+DEFERRABLE_ERRORS = (Throttled,) + TRANSIENT_NET_ERRORS
 CLAUDE_FALLBACK = Path.home() / "AppData" / "Roaming" / "npm" / "claude.cmd"
 BODY_EXCERPT_LEN = 500
 # Only keep posts created within this many hours of the run (the "72-hour
@@ -648,38 +667,58 @@ def _get_with_backoff(
     url: str,
     params: dict | None = None,
     max_retries: int = MAX_RETRIES,
+    net_retries: int = NETWORK_RETRIES,
 ) -> requests.Response:
-    """GET with exponential backoff on throttle codes (403/429/503).
+    """GET with exponential backoff on throttle codes AND transient network drops.
 
-    Honors Retry-After when present, otherwise backs off 20s, 40s, 80s, ...
-    (capped). Raises Throttled if still rate-limited after max_retries (so the
-    caller can defer-and-loop-back), or the underlying HTTPError for any other
-    4xx/5xx. Pass max_retries=0 to fail fast on a throttle — used once the
-    circuit breaker has tripped, so deferring the rest of a pass is cheap.
+    Throttles (403/429/503) back off 20s, 40s, 80s, ... (Retry-After honored);
+    after max_retries still throttled, raises Throttled. Transient network errors
+    (connection reset/dropped/timeout) back off on their own shorter budget
+    (3s, 6s, 12s, ...); after net_retries still failing, the underlying exception
+    propagates. Any other 4xx/5xx raises its HTTPError. Pass max_retries=0 /
+    net_retries=0 to fail fast once the circuit breaker has tripped, so deferring
+    the rest of a pass is cheap.
     """
     noted = False
     resp = None
-    for attempt in range(max_retries + 1):
-        resp = session.get(url, params=params, timeout=20)
+    throttle_attempt = 0
+    net_attempt = 0
+    while True:
+        try:
+            resp = session.get(url, params=params, timeout=20)
+        except TRANSIENT_NET_ERRORS as e:
+            if net_attempt >= net_retries:
+                raise
+            wait = min(NETWORK_BACKOFF_BASE * (2 ** net_attempt), NETWORK_BACKOFF_MAX)
+            wait += random.uniform(0, SLEEP_JITTER)
+            print(
+                f"    .. network error ({type(e).__name__}); retrying in {wait:.0f}s "
+                f"(retry {net_attempt + 1}/{net_retries})",
+                flush=True,
+            )
+            net_attempt += 1
+            time.sleep(wait)
+            continue
         if resp.status_code not in THROTTLE_CODES:
             resp.raise_for_status()
             return resp
         if not noted:  # step the adaptive floor once per request, not per retry
             _note_throttle()
             noted = True
-        if attempt >= max_retries:
+        if throttle_attempt >= max_retries:
             break
         retry_after = resp.headers.get("Retry-After")
         if retry_after and retry_after.strip().isdigit():
             wait = float(retry_after)
         else:
-            wait = min(BACKOFF_BASE * (2 ** attempt), BACKOFF_MAX)
+            wait = min(BACKOFF_BASE * (2 ** throttle_attempt), BACKOFF_MAX)
         wait += random.uniform(0, SLEEP_JITTER)
         print(
             f"    .. {resp.status_code} throttled; backing off {wait:.0f}s "
-            f"(retry {attempt + 1}/{max_retries})",
+            f"(retry {throttle_attempt + 1}/{max_retries})",
             flush=True,
         )
+        throttle_attempt += 1
         time.sleep(wait)
     code = resp.status_code if resp is not None else "?"
     raise Throttled(f"{code} rate-limited after {max_retries} retries: {url}")
@@ -691,6 +730,7 @@ def fetch_subreddit(
     subreddit: str,
     limit: int,
     max_retries: int = MAX_RETRIES,
+    net_retries: int = NETWORK_RETRIES,
 ) -> list[dict]:
     """Scrape one (sub, query) from old.reddit HTML."""
     params = {
@@ -701,7 +741,7 @@ def fetch_subreddit(
         "limit": limit,
     }
     resp = _get_with_backoff(
-        session, REDDIT_SEARCH.format(sub=subreddit), params, max_retries
+        session, REDDIT_SEARCH.format(sub=subreddit), params, max_retries, net_retries
     )
     return parse_search_html(resp.text)
 
@@ -911,7 +951,7 @@ def fetch_all(
             _throttle_state["extra"] = 0.0  # give the retry pass a clean cadence
 
         deferred: list[tuple[str, int, str, str]] = []
-        consecutive_throttles = 0
+        consecutive_fails = 0
         breaker_tripped = False
         for sub, tier, set_name, query in pending:
             if not first:
@@ -919,34 +959,36 @@ def fetch_all(
             first = False
             label = f"T{tier} r/{sub} {set_name} q={query!r}"
             print(f"[{completed}/{total_pairs} p{pass_no}] {label}", flush=True)
-            # Once tripped, try once with no retries so failing pairs defer fast
-            # instead of burning ~5 min of backoff each.
+            # Once tripped, try once with no retries (throttle and network) so
+            # failing pairs defer fast instead of burning minutes of backoff each.
             retries = 0 if breaker_tripped else MAX_RETRIES
+            net_retries = 0 if breaker_tripped else NETWORK_RETRIES
             try:
-                posts = fetch_subreddit(session, query, sub, limit, retries)
-            except Throttled:
-                consecutive_throttles += 1
+                posts = fetch_subreddit(session, query, sub, limit, retries, net_retries)
+            except DEFERRABLE_ERRORS as e:
+                consecutive_fails += 1
                 deferred.append((sub, tier, set_name, query))
-                print("    .. rate-limited; skipping (will loop back)", flush=True)
+                kind = "rate-limited" if isinstance(e, Throttled) else "network error"
+                print(f"    .. {kind}; skipping (will loop back)", flush=True)
                 if (
                     not breaker_tripped
-                    and consecutive_throttles >= CIRCUIT_BREAKER_THRESHOLD
+                    and consecutive_fails >= CIRCUIT_BREAKER_THRESHOLD
                 ):
                     breaker_tripped = True
                     print(
-                        f"    !! {CIRCUIT_BREAKER_THRESHOLD} pairs throttled in a row "
-                        "— circuit breaker tripped: skipping the rest of this pass "
-                        "fast and looping back to them later.",
+                        f"    !! {CIRCUIT_BREAKER_THRESHOLD} pairs failed in a row "
+                        "(rate-limit or network) — circuit breaker tripped: skipping "
+                        "the rest of this pass fast and looping back to them later.",
                         flush=True,
                     )
                 continue
             except requests.RequestException as e:
-                consecutive_throttles = 0
+                consecutive_fails = 0
                 print(f"    !! {e}", flush=True)
                 errors.append({"subreddit": sub, "query": query, "error": str(e)})
                 continue
-            consecutive_throttles = 0
-            if breaker_tripped:  # a success means the IP recovered — resume normal
+            consecutive_fails = 0
+            if breaker_tripped:  # a success means we recovered — resume normal
                 breaker_tripped = False
                 print("    .. requests succeeding again; circuit breaker reset.", flush=True)
             completed += 1
