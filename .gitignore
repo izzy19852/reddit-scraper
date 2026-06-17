@@ -47,3 +47,6 @@ GCS Commands.txt
 # OS
 Thumbs.db
 .DS_Store
+
+# Unrelated sub-project (has its own intended git repo)
+pead-killtest/
