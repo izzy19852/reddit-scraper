@@ -53,8 +53,9 @@ whether any real pair is profitable — that's Step 2.
 
 ## Step 2 — the real test (one command, needs internet)
 
-Run this on your laptop or a VM — anywhere that can reach Binance. It captures a
-spectrum of real pairs at once, runs the kill-test, and writes a findings log.
+Defaults to **Coinbase** (public feed, no API key, US-accessible). Run this on
+your laptop or a VM — anywhere that can reach the exchange. It captures a spectrum
+of real pairs at once, runs the kill-test, and writes a findings log.
 
 ```bash
 # Smoke test first — proves your capture works in ~3 minutes:
@@ -62,19 +63,31 @@ python run_live_test.py --minutes 3
 
 # Then a real read (informed flow needs time to show up):
 python run_live_test.py --minutes 120 \
-    --symbols btcusdt,ethusdt,solusdt,arbusdt,opusdt,linkusdt \
+    --symbols BTC-USD,ETH-USD,SOL-USD,ARB-USD,OP-USD,LINK-USD \
     --rebate 0.0 --horizon 5
 ```
 
-Set `--rebate` to **your venue's actual maker rebate in bps** (0 if none). The
-findings land in `captures/findings_<timestamp>.md` — send me that file.
+Coinbase product ids are dash-form USD pairs (`BTC-USD`). Set `--rebate` to
+**your venue's actual maker rebate in bps** (0 if none). The findings land in
+`captures/findings_<timestamp>.md` — send me that file.
+
+To use Binance instead (deeper books, but blocks US IPs), add
+`--venue binance` and use `btcusdt`-style symbols.
+
+### Side-label sanity check (important for Coinbase)
+
+Coinbase reports the *maker's* side, not the aggressor's. The capture inverts it,
+and the kill-test prints a **SIDE-LABEL SANITY** block: taker buys should print
+at/above mid, sells at/below. If a pair shows `!! LIKELY INVERTED`, the taker side
+is backwards (which would turn toxicity into a fake edge) — tell me and it's a
+one-line fix. Healthy real data sits around 0.8+.
 
 ### Doing it by hand instead (if you prefer)
 
 ```bash
 # Capture pairs one at a time…
-python capture_stub.py --symbol btcusdt --minutes 120 --out captures/BTCUSDT.jsonl
-python capture_stub.py --symbol arbusdt --minutes 120 --out captures/ARBUSDT.jsonl
+python capture_stub.py --venue coinbase --symbol BTC-USD --minutes 120 --out captures/BTC-USD.jsonl
+python capture_stub.py --venue coinbase --symbol ARB-USD --minutes 120 --out captures/ARB-USD.jsonl
 # …then score the folder:
 python run_killtest.py --dir captures --rebate 0.0 --horizon 5 --log captures/findings.txt
 ```

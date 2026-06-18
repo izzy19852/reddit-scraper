@@ -27,7 +27,7 @@ import glob
 import os
 import tempfile
 
-from mm_core import load_tape, simulate, summarize
+from mm_core import load_tape, simulate, summarize, taker_side_sanity
 
 
 QUEUE_POSITIONS = [0.0, 0.10, 0.25]
@@ -40,12 +40,11 @@ def _verdict(net):
 def run_pair(name, book_events, trades, horizon, rebate, fee):
     base = summarize(simulate(book_events, trades, horizon, queue_frac=0.0), rebate, fee)
     nets = {}
-    last = base
     for q in QUEUE_POSITIONS:
-        s = summarize(simulate(book_events, trades, horizon, queue_frac=q), rebate, fee)
-        nets[q] = s
-        last = s
-    return base, nets
+        nets[q] = summarize(simulate(book_events, trades, horizon, queue_frac=q),
+                            rebate, fee)
+    sanity = taker_side_sanity(book_events, trades)
+    return base, nets, sanity
 
 
 def evaluate_dir(directory, horizon, rebate, fee):
@@ -55,8 +54,8 @@ def evaluate_dir(directory, horizon, rebate, fee):
     for path in files:
         name = os.path.splitext(os.path.basename(path))[0]
         book_events, trades = load_tape(path)
-        base, nets = run_pair(name, book_events, trades, horizon, rebate, fee)
-        rows.append((name, base, nets))
+        base, nets, sanity = run_pair(name, book_events, trades, horizon, rebate, fee)
+        rows.append((name, base, nets, sanity))
     return rows
 
 
@@ -71,7 +70,7 @@ def format_table(rows, rebate, fee, horizon):
       f"{'net@q0.00':>11}{'net@q0.10':>11}{'net@q0.25':>11}  verdict")
     p("-" * 100)
     survivors = []
-    for name, base, nets in rows:
+    for name, base, nets, _sanity in rows:
         if base["n_fills"] == 0:
             p(f"{name:<14}{'0':>7}   (no fills — empty or too-short capture)")
             continue
@@ -91,6 +90,25 @@ def format_table(rows, rebate, fee, horizon):
     else:
         p("NO SURVIVORS @ q0.25 — a clean, capital-free kill. If the spread can't beat")
         p("  adverse selection on the recorded tape, it won't from the slower real queue.")
+    p("=" * 100)
+
+    # --- side-label sanity: catch an inverted taker side before trusting a verdict
+    p("")
+    p("SIDE-LABEL SANITY  (taker buys should print >= mid; sells <= mid)")
+    p(f"{'pair':<14}{'buy>=mid':>10}{'sell<=mid':>11}   note")
+    for name, base, nets, s in rows:
+        b, sl = s["buy_above_mid"], s["sell_below_mid"]
+        if b != b or sl != sl:  # nan -> no trades to judge
+            note = "no trades"
+        elif b < 0.5 and sl < 0.5:
+            note = "!! LIKELY INVERTED — fix taker side before trusting this pair"
+        elif b < 0.65 or sl < 0.65:
+            note = "weak — verdict may be unreliable"
+        else:
+            note = "ok"
+        bstr = "  n/a" if b != b else f"{b:>9.2f}"
+        sstr = "   n/a" if sl != sl else f"{sl:>10.2f}"
+        p(f"{name:<14}{bstr}{sstr}   {note}")
     p("=" * 100)
     return "\n".join(out)
 

@@ -226,6 +226,42 @@ def summarize(fills: List[Fill], rebate_bps: float = 0.0,
 
 
 # --------------------------------------------------------------------------- #
+# Side-label sanity check
+# --------------------------------------------------------------------------- #
+def taker_side_sanity(book_events: List[BookEvent],
+                      trades: List[Trade]) -> Dict[str, float]:
+    """Are trades labelled with the correct aggressor side?
+
+    A correctly-labelled taker BUY lifts the ask, so it should print at/above the
+    mid; a taker SELL hits the bid, so it should print at/below the mid. We report
+    the fraction that agree. Healthy data sits high (~0.8+). If both fractions are
+    near zero the taker side is almost certainly inverted (a real risk with venues
+    like Coinbase that report the *maker* side) — which would silently turn
+    toxicity into a fake edge.
+    """
+    mc = _MidCurve(book_events)
+    n_buy = n_sell = buy_ok = sell_ok = 0
+    for t in trades:
+        m = mc.at(t.ts)
+        if m is None:
+            continue
+        if t.side == "buy":
+            n_buy += 1
+            if t.price >= m:
+                buy_ok += 1
+        else:
+            n_sell += 1
+            if t.price <= m:
+                sell_ok += 1
+    return {
+        "buy_above_mid": (buy_ok / n_buy) if n_buy else float("nan"),
+        "sell_below_mid": (sell_ok / n_sell) if n_sell else float("nan"),
+        "n_buy": n_buy,
+        "n_sell": n_sell,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Tape loading (JSONL produced by capture_stub.py)
 # --------------------------------------------------------------------------- #
 def load_tape(path: str):
