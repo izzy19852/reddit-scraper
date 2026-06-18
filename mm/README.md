@@ -24,31 +24,59 @@ empirical question you *measure*, not assume.
 
 | file | role |
 |------|------|
-| `mm_core.py`      | shadow-quote simulator + markout (realized-spread) engine |
-| `capture_stub.py` | live websocket capture → JSONL (run on your VM) |
-| `run_killtest.py` | multi-pair verdict table (gross / adverse / realized / net@queue) |
-| `validate_mm.py`  | proof the engine separates benign flow from toxic flow |
+| `mm_core.py`       | shadow-quote simulator + markout (realized-spread) engine |
+| `capture_stub.py`  | live websocket capture → JSONL (one pair) |
+| `run_killtest.py`  | multi-pair verdict table (gross / adverse / realized / net@queue) |
+| `run_live_test.py` | **one command**: capture real data → run kill-test → log findings |
+| `validate_mm.py`   | proof the engine separates benign flow from toxic flow |
 
-## Quick start (no network needed)
+## Step 0 — install (needs Python 3.9+)
 
 ```bash
-pip install -r requirements.txt
-python validate_mm.py            # prove the engine works (benign EDGE vs toxic DEAD)
-python run_killtest.py --demo --rebate 0.5   # see the verdict table on synthetic data
+cd mm
+python -m pip install -r requirements.txt
 ```
 
-## Real run
+On Windows use `python`, on most Mac/Linux setups use `python3`. That's the only
+substitution you'll make below.
 
-The sandbox can't reach exchanges; your VM can.
+## Step 1 — prove the tool works, offline (no internet, ~10 seconds)
 
 ```bash
-# 1. Capture a SPECTRUM — don't pre-pick large-cap. ~2h each.
+python validate_mm.py                          # benign EDGE vs toxic DEAD
+python run_killtest.py --demo --rebate 0.5     # see the verdict table on synthetic data
+```
+
+This is a unit test of the *measuring instrument*. It confirms the engine reads
+adverse selection correctly when the answer is known. It says **nothing** about
+whether any real pair is profitable — that's Step 2.
+
+## Step 2 — the real test (one command, needs internet)
+
+Run this on your laptop or a VM — anywhere that can reach Binance. It captures a
+spectrum of real pairs at once, runs the kill-test, and writes a findings log.
+
+```bash
+# Smoke test first — proves your capture works in ~3 minutes:
+python run_live_test.py --minutes 3
+
+# Then a real read (informed flow needs time to show up):
+python run_live_test.py --minutes 120 \
+    --symbols btcusdt,ethusdt,solusdt,arbusdt,opusdt,linkusdt \
+    --rebate 0.0 --horizon 5
+```
+
+Set `--rebate` to **your venue's actual maker rebate in bps** (0 if none). The
+findings land in `captures/findings_<timestamp>.md` — send me that file.
+
+### Doing it by hand instead (if you prefer)
+
+```bash
+# Capture pairs one at a time…
 python capture_stub.py --symbol btcusdt --minutes 120 --out captures/BTCUSDT.jsonl
 python capture_stub.py --symbol arbusdt --minutes 120 --out captures/ARBUSDT.jsonl
-python capture_stub.py --symbol <thin>  --minutes 120 --out captures/THIN.jsonl
-
-# 2. Verdict, per pair, at three queue positions.
-python run_killtest.py --dir captures --rebate <your maker rebate> --horizon 5
+# …then score the folder:
+python run_killtest.py --dir captures --rebate 0.0 --horizon 5 --log captures/findings.txt
 ```
 
 `net@q0.25` assumes a quarter of the displayed book trades **ahead** of you. A

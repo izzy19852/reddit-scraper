@@ -48,37 +48,55 @@ def run_pair(name, book_events, trades, horizon, rebate, fee):
     return base, nets
 
 
-def print_table(rows, rebate, fee, horizon):
-    print()
-    print(f"REALIZED-SPREAD KILL-TEST   (horizon={horizon}s  rebate={rebate:+.2f}bps  fee={fee:.2f}bps)")
-    print("=" * 100)
-    hdr = (f"{'pair':<14}{'fills':>7}{'gross½':>9}{'adverse':>9}{'realized':>10}"
-           f"{'net@q0.00':>11}{'net@q0.10':>11}{'net@q0.25':>11}  verdict")
-    print(hdr)
-    print("-" * 100)
+def evaluate_dir(directory, horizon, rebate, fee):
+    """Load every *.jsonl in `directory` and evaluate it. Returns table rows."""
+    files = sorted(glob.glob(os.path.join(directory, "*.jsonl")))
+    rows = []
+    for path in files:
+        name = os.path.splitext(os.path.basename(path))[0]
+        book_events, trades = load_tape(path)
+        base, nets = run_pair(name, book_events, trades, horizon, rebate, fee)
+        rows.append((name, base, nets))
+    return rows
+
+
+def format_table(rows, rebate, fee, horizon):
+    """Build the verdict table as a string (so it can be printed AND logged)."""
+    out = []
+    p = out.append
+    p("")
+    p(f"REALIZED-SPREAD KILL-TEST   (horizon={horizon}s  rebate={rebate:+.2f}bps  fee={fee:.2f}bps)")
+    p("=" * 100)
+    p(f"{'pair':<14}{'fills':>7}{'gross½':>9}{'adverse':>9}{'realized':>10}"
+      f"{'net@q0.00':>11}{'net@q0.10':>11}{'net@q0.25':>11}  verdict")
+    p("-" * 100)
     survivors = []
     for name, base, nets in rows:
         if base["n_fills"] == 0:
-            print(f"{name:<14}{'0':>7}   (no fills — empty or too-short capture)")
+            p(f"{name:<14}{'0':>7}   (no fills — empty or too-short capture)")
             continue
-        q25 = nets[0.25]
-        verdict = _verdict(q25["net_bps"])
+        verdict = _verdict(nets[0.25]["net_bps"])
         if verdict == "EDGE":
             survivors.append(name)
-        print(f"{name:<14}{base['n_fills']:>7}"
-              f"{base['eff_half_bps']:>9.3f}{base['adverse_bps']:>9.3f}"
-              f"{base['realized_bps']:>10.3f}"
-              f"{nets[0.0]['net_bps']:>11.3f}{nets[0.10]['net_bps']:>11.3f}"
-              f"{nets[0.25]['net_bps']:>11.3f}  {verdict}")
-    print("-" * 100)
+        p(f"{name:<14}{base['n_fills']:>7}"
+          f"{base['eff_half_bps']:>9.3f}{base['adverse_bps']:>9.3f}"
+          f"{base['realized_bps']:>10.3f}"
+          f"{nets[0.0]['net_bps']:>11.3f}{nets[0.10]['net_bps']:>11.3f}"
+          f"{nets[0.25]['net_bps']:>11.3f}  {verdict}")
+    p("-" * 100)
     if survivors:
-        print(f"SURVIVORS @ q0.25 (back of queue): {', '.join(survivors)}")
-        print("  -> necessary, not sufficient. Next step is paper-quoting live; the public")
-        print("     tape can't see your true queue position or model your own cancels.")
+        p(f"SURVIVORS @ q0.25 (back of queue): {', '.join(survivors)}")
+        p("  -> necessary, not sufficient. Next step is paper-quoting live; the public")
+        p("     tape can't see your true queue position or model your own cancels.")
     else:
-        print("NO SURVIVORS @ q0.25 — a clean, capital-free kill. If the spread can't beat")
-        print("  adverse selection on the recorded tape, it won't from the slower real queue.")
-    print("=" * 100)
+        p("NO SURVIVORS @ q0.25 — a clean, capital-free kill. If the spread can't beat")
+        p("  adverse selection on the recorded tape, it won't from the slower real queue.")
+    p("=" * 100)
+    return "\n".join(out)
+
+
+def print_table(rows, rebate, fee, horizon):
+    print(format_table(rows, rebate, fee, horizon))
 
 
 # --------------------------------------------------------------------------- #
@@ -123,6 +141,7 @@ def main():
     ap.add_argument("--fee", type=float, default=0.0, help="maker fee (bps), if any")
     ap.add_argument("--demo", action="store_true",
                     help="generate a synthetic spectrum and run on it (no network)")
+    ap.add_argument("--log", help="also append the verdict table to this file")
     args = ap.parse_args()
 
     tmp = None
@@ -136,19 +155,17 @@ def main():
             ap.error("provide --dir <captures> or --demo")
         directory = args.dir
 
-    files = sorted(glob.glob(os.path.join(directory, "*.jsonl")))
-    if not files:
+    if not glob.glob(os.path.join(directory, "*.jsonl")):
         ap.error(f"no *.jsonl captures found in {directory}")
 
-    rows = []
-    for path in files:
-        name = os.path.splitext(os.path.basename(path))[0]
-        book_events, trades = load_tape(path)
-        base, nets = run_pair(name, book_events, trades, args.horizon,
-                              args.rebate, args.fee)
-        rows.append((name, base, nets))
+    rows = evaluate_dir(directory, args.horizon, args.rebate, args.fee)
+    table = format_table(rows, args.rebate, args.fee, args.horizon)
+    print(table)
 
-    print_table(rows, args.rebate, args.fee, args.horizon)
+    if args.log:
+        with open(args.log, "a") as fh:
+            fh.write(table + "\n")
+        print(f"\n[log] appended to {args.log}")
 
 
 if __name__ == "__main__":
