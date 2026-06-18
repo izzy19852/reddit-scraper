@@ -1,0 +1,7 @@
+# mm/ — realized-spread (markout) kill-test
+#
+# mm_core.py and run_killtest.py are pure-Python (no deps).
+# numpy is used by validate_mm.py (synthetic tape generation + stats).
+# websockets is used only by capture_stub.py (live capture on your VM).
+numpy>=1.24
+websockets>=12.0
